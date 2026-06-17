@@ -57,7 +57,8 @@ tests/
 ├── test_model.py           # Architecture tests (RMSNorm, RoPE, GQA, forward shapes)
 ├── test_diffusion.py       # Diffusion pipeline tests (process, loss, sampler)
 ├── test_biolab_adapter.py  # biolab LM protocol tests (tokeniser, embeddings, generation)
-└── test_preprocessing.py  # Parser + BPE extraction tests (GTO, GFF3, rev-comp)
+├── test_preprocessing.py  # Parser + BPE extraction tests (GTO, GFF3, rev-comp)
+└── test_bio_features.py    # Biological attention features (rel-dist bias, strand bias, HDF5 round-trip)
 
 scripts/
 ├── polaris_preprocess.sh   # PBS job: Phase 0 data pipeline on Polaris
@@ -155,11 +156,14 @@ mpiexec -n 16 --ppn 4 python -m diffgenslm.preprocessing.build_hdf5 [same args]
 
 Each rank writes its own shard: `train_rank0000.h5`, `val_rank0000.h5`, etc. The training dataloader picks up all shards automatically.
 
-**HDF5 layout** (compatible with GenSLM-2):
+**HDF5 layout**:
 ```
 input_ids       : int32[N_total_tokens]   # all sequences concatenated
+strand_ids      : int8[N_total_tokens]    # per-token strand label (0=pad, 1=fwd, 2=rev, 3=intergenic)
 sequence_starts : int64[N_sequences]      # byte offset of each sequence start
 ```
+
+`strand_ids` is always written by the current pipeline. Old HDF5 files without this dataset are still readable — the dataset loader falls back to all-zero strand labels.
 
 On Polaris, the full Phase 0 pipeline is wrapped in `scripts/polaris_preprocess.sh`.
 
@@ -232,6 +236,8 @@ model:
   num_kv_heads: 4           # GQA: 2 Q heads per KV head
   ffn_intermediate_size: 1366
   max_seq_len: 4096
+  max_rel_dist: 128         # relative distance bias buckets (HiSAN)
+  same_strand_bias_init: 0.1
 
 training:
   batch_size: 8             # per GPU
@@ -249,6 +255,8 @@ model:
   num_heads: 16
   num_kv_heads: 8
   max_seq_len: 8192
+  max_rel_dist: 128
+  same_strand_bias_init: 0.1
 
 training:
   batch_size: 4
@@ -393,7 +401,7 @@ for m in metrics:
 ## Testing
 
 ```bash
-# Run the full suite (116 tests, ~2 seconds on CPU)
+# Run the full suite (142 tests, ~2 seconds on CPU)
 pytest tests/ -q
 
 # Run a specific module
@@ -401,6 +409,7 @@ pytest tests/test_model.py -v
 pytest tests/test_diffusion.py -v
 pytest tests/test_biolab_adapter.py -v
 pytest tests/test_preprocessing.py -v
+pytest tests/test_bio_features.py -v
 ```
 
 | File | Tests | What's covered |
@@ -409,8 +418,9 @@ pytest tests/test_preprocessing.py -v
 | `test_diffusion.py` | 29 | Forward process masking statistics, ELBO vs. unweighted loss, unmasking schedules, sampler invariants (no residual masks, fixed positions preserved, seed reproducibility) |
 | `test_biolab_adapter.py` | 38 | `NuclCharTokenizer` encode/decode/tokenize, config JSON+YAML roundtrip, embedding shapes and dtypes, generated sequences contain no mask tokens, fixed context preserved |
 | `test_preprocessing.py` | 35 | GTO coordinate conversion (1-based→0-based, fwd/rev strand), feature type filtering, GFF3 parsing, `build_id_mapping_from_gtos`, reverse-complement extraction |
+| `test_bio_features.py` | 26 | Relative distance bias shape/symmetry/clamping, same-strand bias learnability, padding mask correctness, HDF5 strand_ids round-trip, backward-compatible fallback to zeros, region type mapping |
 
-Fixtures live in `tests/conftest.py`: a session-scoped tiny model (`vocab=64`, `hidden=32`, `layers=2`) and matching checkpoint/tokenizer-dir pair let all tests run without disk I/O beyond a temporary directory.
+Fixtures live in `tests/conftest.py`: a session-scoped tiny model (`vocab=64`, `hidden=32`, `layers=2`, `max_rel_dist=16`) and matching checkpoint/tokenizer-dir pair let all tests run without disk I/O beyond a temporary directory.
 
 ---
 
@@ -427,13 +437,50 @@ Key design choices:
 - **Tied input/output embeddings** — `lm_head.weight = embed.weight`
 - **Weight init**: normal(0, 0.02) for all Linear and Embedding layers
 
+### Biologically-aware attention (ported from HiSAN)
+
+Three biologically-motivated signals are added to the attention scores inside every `BidirectionalGQA` layer before the softmax:
+
+**1. Relative distance bias**
+Each attention head learns an independent bias for each token-pair distance bucket. The signed distance `i − j` is converted to `|i − j|` and clamped to `max_rel_dist` (default 128), producing an `(L × L)` index matrix that looks up a `(max_rel_dist+1) × num_heads` embedding table. This lets each head learn its own locality preference — a biologically sensible prior since operons, regulatory elements, and syntenic blocks have characteristic length scales.
+
+```
+rel_bias : nn.Embedding(max_rel_dist + 1, num_heads)
+scores   += rel_bias(|i-j|.clamp(max_rel_dist)).permute(2,0,1)   # [1, H, L, L]
+```
+
+**2. Same-strand bias**
+A single learnable scalar is added to attention scores when both query and key tokens share the same non-zero strand label (`1` = forward, `2` = reverse, `3` = intergenic). This biases the model to attend within a strand first, reflecting the co-transcriptional organisation of bacterial genomes.
+
+```
+same_strand_bias : nn.Parameter(tensor(0.1))
+same = (strand_i == strand_j) & (strand_i != 0)   # [B, L, L]
+scores += same_strand_bias * same.unsqueeze(1)
+```
+
+**3. Padding mask**
+Variable-length contigs are padded to a fixed `seq_len`. Padding positions are set to `−∞` before the softmax so they contribute zero attention weight, allowing a single batch to mix sequences of different lengths without leaking pad signal.
+
+#### Strand encoding
+
+Per-token strand labels are stored alongside `input_ids` in the HDF5 file and loaded by the dataloader:
+
+| Value | Meaning |
+|---|---|
+| 0 | Padding / BOS / EOS (no strand) |
+| 1 | Forward strand (+) |
+| 2 | Reverse strand (−) |
+| 3 | Intergenic / non-coding (strand-ambiguous) |
+
+Strand labels are optional at inference: passing `strand_ids=None` skips the same-strand bias (equivalent to all-zero labels), so the model degrades gracefully on sequences without annotation.
+
 ---
 
 ## Adding a new genome data source
 
 1. Implement a parser that returns a `GenomeRecord` (see `preprocessing/genome_records.py` for the dataclasses).
 2. Add it as a branch in `preprocessing/build_hdf5.py` alongside the existing GTO and GFF/FASTA branches.
-3. The rest of the pipeline (`_tokenize_contig`, HDF5 writing, train/val/test splitting) is format-agnostic.
+3. The rest of the pipeline (`_tokenize_contig_with_strand`, HDF5 writing, train/val/test splitting) is format-agnostic.
 
 ## Adding a new tokenizer distribution
 
@@ -441,7 +488,7 @@ The composite vocabulary concatenates three sub-vocabularies with non-overlappin
 
 1. Train (or define) the new tokenizer.
 2. Update `load_tokenizer()` in `diffgenslm/tokenizer/__init__.py` to load it.
-3. Update `_tokenize_contig()` in `build_hdf5.py` to route the appropriate genomic region type to the new tokenizer.
+3. Add a routing branch in `_tokenize_contig_with_strand()` in `build_hdf5.py` and assign it an appropriate strand label.
 4. Update `vocab_size` in your YAML config to reflect the new total.
 
 ---
