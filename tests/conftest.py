@@ -34,6 +34,8 @@ def tiny_cfg() -> DiffGenomeConfig:
         dropout=0.0,       # deterministic during tests
         pad_token_id=0,
         mask_token_id=4,
+        max_rel_dist=16,           # small for tests (seq_len=32, so 16 covers half)
+        same_strand_bias_init=0.1,
     )
 
 

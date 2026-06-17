@@ -6,9 +6,10 @@ Tokenization strategy (GenSLM-2 CompositeGenomeTokenizerV2):
   misc/tRNA/rRNA     → functional BPE  (SentencePiece)
   Intergenic gaps    → noncoding BPE   (SentencePiece)
 
-Output HDF5 layout (compatible with GenSLM-2's GenomeDataset):
-  input_ids      : 1-D int32 array, all sequences concatenated
-  sequence_starts: 1-D int64 array, start offset of each sequence
+Output HDF5 layout:
+  input_ids      : 1-D int32, all sequences concatenated
+  strand_ids     : 1-D int8,  strand label per token (0=pad, 1=fwd, 2=rev, 3=intergenic)
+  sequence_starts: 1-D int64, start offset of each sequence
 
 MPI parallelism: each rank processes rank::world_size files.
 
@@ -27,17 +28,26 @@ Usage (Polaris / mpiexec):
 
 import argparse
 import json
-import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
 
-from .genome_records import ContigRecord, GenomeRecord
+from .genome_records import ContigRecord
 from .parse_gto import build_id_mapping_from_gtos, parse_gto
 from .parse_gff_fasta import parse_gff_fasta
+
+# ---------------------------------------------------------------------------
+# Strand ID constants (shared with genome_dataset.py and diffgenome.py)
+# ---------------------------------------------------------------------------
+
+STRAND_PAD        = 0   # BOS, EOS, pad tokens — no strand
+STRAND_FWD        = 1   # forward / + strand
+STRAND_REV        = 2   # reverse / − strand
+STRAND_INTERGENIC = 3   # intergenic / non-coding (strand-ambiguous)
+
 
 # ---------------------------------------------------------------------------
 # MPI helpers
@@ -62,11 +72,18 @@ def _mpi_barrier():
 
 
 # ---------------------------------------------------------------------------
-# HDF5 writer (mirrors GenSLM-2's HDF5Writer for compatibility)
+# HDF5 writer
 # ---------------------------------------------------------------------------
 
 class _HDF5Writer:
-    """Write tokenized sequences to HDF5 in a contiguous 1-D token stream."""
+    """
+    Write tokenized sequences to HDF5 in a contiguous 1-D token stream.
+
+    Stores three datasets:
+      input_ids       — int32, token IDs
+      strand_ids      — int8,  per-token strand labels (only when provided)
+      sequence_starts — int64, start index of each sequence in the flat arrays
+    """
 
     def __init__(self, output_path: str, vocab_size: int, special_tokens: dict,
                  buffer_size: int = 100_000, compression: str = "gzip"):
@@ -76,17 +93,24 @@ class _HDF5Writer:
         self.buffer_size = buffer_size
         self.compression = compression
 
-        self._token_buf: List[int] = []
-        self._start_buf: List[int] = []
+        self._token_buf:  List[int] = []
+        self._strand_buf: List[int] = []
+        self._start_buf:  List[int] = []
         self._total_tokens = 0
         self._num_seqs = 0
+        self._has_strands = False
+
         self._h5 = None
         self._ids_ds = None
+        self._strands_ds = None
         self._starts_ds = None
 
-    def add(self, token_ids: List[int]):
+    def add(self, token_ids: List[int], strand_ids: Optional[List[int]] = None):
         self._start_buf.append(self._total_tokens + len(self._token_buf))
         self._token_buf.extend(token_ids)
+        if strand_ids is not None:
+            self._strand_buf.extend(strand_ids)
+            self._has_strands = True
         self._num_seqs += 1
         if len(self._token_buf) >= self.buffer_size:
             self._flush()
@@ -101,6 +125,10 @@ class _HDF5Writer:
         self._ids_ds.resize((cur + n,))
         self._ids_ds[cur : cur + n] = np.array(self._token_buf, dtype=np.int32)
 
+        if self._has_strands and self._strands_ds is not None:
+            self._strands_ds.resize((cur + n,))
+            self._strands_ds[cur : cur + n] = np.array(self._strand_buf, dtype=np.int8)
+
         ns = len(self._start_buf)
         curs = self._starts_ds.shape[0]
         self._starts_ds.resize((curs + ns,))
@@ -108,6 +136,7 @@ class _HDF5Writer:
 
         self._total_tokens += n
         self._token_buf = []
+        self._strand_buf = []
         self._start_buf = []
         self._h5.flush()
 
@@ -119,6 +148,11 @@ class _HDF5Writer:
             "input_ids", shape=(0,), maxshape=(None,), dtype=np.int32,
             chunks=(chunk,), compression=self.compression,
         )
+        if self._has_strands:
+            self._strands_ds = self._h5.create_dataset(
+                "strand_ids", shape=(0,), maxshape=(None,), dtype=np.int8,
+                chunks=(chunk,), compression=self.compression,
+            )
         self._starts_ds = self._h5.create_dataset(
             "sequence_starts", shape=(0,), maxshape=(None,), dtype=np.int64,
             chunks=(1024,), compression=self.compression,
@@ -128,21 +162,23 @@ class _HDF5Writer:
         self._flush()
         if self._h5 is None:
             self._open()
-        self._h5.attrs["bos_token_id"] = self.special_tokens.get("<bos>", 1)
-        self._h5.attrs["eos_token_id"] = self.special_tokens.get("<eos>", 2)
-        self._h5.attrs["pad_token_id"] = self.special_tokens.get("<pad>", 0)
+        self._h5.attrs["bos_token_id"]  = self.special_tokens.get("<bos>", 1)
+        self._h5.attrs["eos_token_id"]  = self.special_tokens.get("<eos>", 2)
+        self._h5.attrs["pad_token_id"]  = self.special_tokens.get("<pad>", 0)
         self._h5.attrs["mask_token_id"] = self.special_tokens.get("<mask>", 4)
         self._h5.attrs["num_sequences"] = self._num_seqs
-        self._h5.attrs["total_tokens"] = self._total_tokens
-        self._h5.attrs["vocab_size"] = self.vocab_size
+        self._h5.attrs["total_tokens"]  = self._total_tokens
+        self._h5.attrs["vocab_size"]    = self.vocab_size
+        self._h5.attrs["has_strand_ids"] = self._has_strands
         if metadata:
             self._h5.attrs["metadata"] = json.dumps(metadata)
         self._h5.close()
-        print(f"[HDF5] {self._num_seqs} sequences, {self._total_tokens:,} tokens → {self.output_path}")
+        strand_note = " + strand_ids" if self._has_strands else ""
+        print(f"[HDF5] {self._num_seqs} sequences, {self._total_tokens:,} tokens{strand_note} → {self.output_path}")
 
 
 # ---------------------------------------------------------------------------
-# Region extraction (mirrors GenSLM-2 composite tokenizer region logic)
+# Region extraction
 # ---------------------------------------------------------------------------
 
 def _find_intergenic_regions(contig: ContigRecord) -> List[Tuple[int, int]]:
@@ -182,58 +218,90 @@ def _build_region_list(contig: ContigRecord) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Tokenize one contig using composite tokenizer
+# Tokenize one contig — two variants
 # ---------------------------------------------------------------------------
 
-def _tokenize_contig(
+# Maps raw feature_type from GTO/GFF → CompositeGenomeTokenizerV2 region types.
+# "misc_feature" covers tRNA, rRNA, and other functional non-coding elements;
+# they use the functional BPE tokenizer, not the noncoding BPE.
+_REGION_TYPE_MAP = {
+    "CDS":          "CDS",
+    "misc_feature": "functional_non_coding",
+    "non_coding":   "non_coding",
+}
+
+
+def _tokenize_contig_with_strand(
     contig: ContigRecord,
-    tokenizer,           # CompositeGenomeTokenizerV2 instance
-    chunk_size: int = 10_000_000,
-) -> List[int]:
+    tokenizer,
+) -> Tuple[List[int], List[int]]:
     """
-    Tokenize a full contig using the composite tokenizer.
+    Tokenize a full contig and return aligned (token_ids, strand_ids).
 
-    Rather than passing a BioPython SeqRecord (not always available), we
-    reconstruct a GenomicRegionV2 list from our FeatureRecords and call
-    the tokenizer's internal _tokenize_sequence directly.
+    Strand encoding:
+      STRAND_PAD        (0) — BOS / EOS / pad
+      STRAND_FWD        (1) — forward (+) CDS or functional non-coding
+      STRAND_REV        (2) — reverse (−) CDS or functional non-coding
+      STRAND_INTERGENIC (3) — intergenic / non-coding
 
-    Falls back to tokenizer.encode(sequence) when annotations are absent.
+    Also fixes the misc_feature → functional_non_coding mapping (tRNA/rRNA
+    were previously sent to the noncoding BPE instead of the functional BPE).
     """
-    try:
-        from genslm2.composite_tokenizer_v2 import (
-            CompositeGenomeTokenizerV2,
-            GenomicRegionV2,
-        )
-    except ImportError:
-        raise ImportError(
-            "GenSLM-2 is required for tokenization.\n"
-            "Install: pip install git+https://github.com/StarNetLaboratory/GenSLM-2.git"
-        )
-
     if not contig.features:
-        # No annotations: treat whole contig as non-coding
         result = tokenizer.encode(contig.sequence, add_special_tokens=True)
-        return result["input_ids"]
-
-    # Build GenomicRegionV2 objects from our FeatureRecords
-    regions = []
-    for r in _build_region_list(contig):
-        regions.append(
-            GenomicRegionV2(
-                start=r["start"],
-                end=r["end"],
-                region_type=r["region_type"],
-                strand=r["strand"],
-                frame=r["frame"],
-            )
+        ids = result["input_ids"]
+        n = len(ids)
+        strands = (
+            [STRAND_PAD]
+            + [STRAND_INTERGENIC] * max(0, n - 2)
+            + ([STRAND_PAD] if n >= 2 else [])
         )
+        return ids, strands[:n]
 
-    return tokenizer._tokenize_sequence(
-        contig.sequence,
-        regions,
-        add_bos=True,
-        add_eos=True,
-    )
+    token_ids  = [tokenizer.bos_token_id]
+    strand_ids = [STRAND_PAD]
+
+    for r in _build_region_list(contig):
+        rtype = _REGION_TYPE_MAP.get(r["region_type"], "non_coding")
+        region_seq = contig.sequence[r["start"]:r["end"]]
+        if not region_seq:
+            continue
+
+        rev = r["strand"] == -1
+        if rev:
+            region_seq = tokenizer._reverse_complement(region_seq)
+
+        if rtype == "CDS":
+            frame = r["frame"] if r["frame"] > 0 else 0
+            coding_seq = region_seq[frame:]
+            tokens    = tokenizer.codon_tokenizer.tokenize(
+                coding_seq, prefix_singles=r.get("prefix_singles", 0)
+            )
+            local_ids = tokenizer.codon_tokenizer.convert_tokens_to_ids(tokens)
+            global_ids = [tokenizer._map_to_global_id("codon", lid) for lid in local_ids]
+            sid = STRAND_REV if rev else STRAND_FWD
+
+        elif rtype == "functional_non_coding":
+            local_ids = tokenizer.tokenization_chunker.chunk_and_tokenize(
+                region_seq, tokenizer.functional_tokenizer, rtype
+            )
+            global_ids = [tokenizer._map_to_global_id("functional", lid) for lid in local_ids]
+            sid = STRAND_REV if rev else STRAND_FWD
+
+        else:  # non_coding / intergenic
+            local_ids = tokenizer.tokenization_chunker.chunk_and_tokenize(
+                region_seq, tokenizer.noncoding_tokenizer, rtype
+            )
+            global_ids = [tokenizer._map_to_global_id("noncoding", lid) for lid in local_ids]
+            sid = STRAND_INTERGENIC
+
+        token_ids.extend(global_ids)
+        strand_ids.extend([sid] * len(global_ids))
+
+    token_ids.append(tokenizer.eos_token_id)
+    strand_ids.append(STRAND_PAD)
+
+    return token_ids, strand_ids
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +318,9 @@ def _genome_iterator(
     all_maps: dict,
 ):
     """Yield GenomeRecords for files assigned to this rank."""
-    # Collect all genome source files
-    sources: List[Tuple[str, Path, Optional[Path]]] = []  # (mode, primary, secondary)
+    sources: List[Tuple[str, Path, Optional[Path]]] = []
 
     if file_list:
-        # Explicit file list (train/val/test split already done)
         for p in file_list:
             if p.suffix == ".gto":
                 sources.append(("gto", p, None))
@@ -268,7 +334,6 @@ def _genome_iterator(
             for p in sorted(gff_dir.glob("*.gff")):
                 sources.append(("gff", p, None))
 
-    # Rank sharding
     my_sources = sources[rank::world_size]
 
     for mode, primary, _ in my_sources:
@@ -318,7 +383,7 @@ def _split_files(
 
     n = len(files)
     n_train = int(n * train_frac)
-    n_val = int(n * val_frac)
+    n_val   = int(n * val_frac)
 
     return files[:n_train], files[n_train : n_train + n_val], files[n_train + n_val :]
 
@@ -334,7 +399,6 @@ def run(args):
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load composite tokenizer
     try:
         from genslm2.composite_tokenizer_v2 import CompositeGenomeTokenizerV2
     except ImportError:
@@ -348,18 +412,16 @@ def run(args):
         functional_tokenizer_path=str(tdir / "functional_bpe.model"),
         noncoding_tokenizer_path=str(tdir / "noncoding_bpe.model"),
     )
-    vocab_size = tokenizer.vocab_size
+    vocab_size    = tokenizer.vocab_size
     special_tokens = tokenizer.special_token_ids
 
     if is_main:
         print(f"  vocab_size = {vocab_size}")
 
-    # Build contig ID mapping from available GTOs
     all_maps: dict = {}
     if args.gto_dir and Path(args.gto_dir).exists():
         all_maps = build_id_mapping_from_gtos(Path(args.gto_dir))
 
-    # Split files across train / val / test
     train_files, val_files, test_files = _split_files(
         Path(args.gto_dir) if args.gto_dir else None,
         Path(args.gff_dir) if args.gff_dir else None,
@@ -389,14 +451,16 @@ def run(args):
                 if len(contig.sequence) < args.min_contig_len:
                     continue
                 try:
-                    token_ids = _tokenize_contig(contig, tokenizer, args.chunk_size)
+                    token_ids, strand_ids = _tokenize_contig_with_strand(
+                        contig, tokenizer
+                    )
                 except Exception as e:
                     print(f"[WARN] tokenize failed {genome.genome_id}/{contig.contig_id}: {e}")
                     continue
                 if token_ids:
-                    writer.add(token_ids)
+                    writer.add(token_ids, strand_ids)
                     n_contigs += 1
-                    n_tokens += len(token_ids)
+                    n_tokens  += len(token_ids)
 
         writer.finalize({"split": split_name, "rank": rank, "n_contigs": n_contigs})
         print(f"[rank {rank}] {split_name}: {n_contigs} contigs, {n_tokens:,} tokens")
@@ -408,20 +472,17 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser(description="Tokenize genomes to HDF5")
-    ap.add_argument("--gto_dir", type=Path, default=None, help="Directory of *.gto files")
-    ap.add_argument("--fasta_dir", type=Path, default=None, help="Directory of *.fasta files")
-    ap.add_argument("--gff_dir", type=Path, default=None, help="Directory of *.gff files")
+    ap.add_argument("--gto_dir",       type=Path, default=None)
+    ap.add_argument("--fasta_dir",     type=Path, default=None)
+    ap.add_argument("--gff_dir",       type=Path, default=None)
     ap.add_argument("--tokenizer_dir", type=Path, required=True,
                     help="Directory with codon/, functional_bpe.model, noncoding_bpe.model")
-    ap.add_argument("--output_dir", type=Path, required=True)
-    ap.add_argument("--train_frac", type=float, default=0.8)
-    ap.add_argument("--val_frac", type=float, default=0.1)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--min_contig_len", type=int, default=500,
-                    help="Skip contigs shorter than this (bp)")
-    ap.add_argument("--chunk_size", type=int, default=10_000_000,
-                    help="Max sequence length per BPE call (BPE performance)")
-    ap.add_argument("--compression", default="gzip", choices=["gzip", "lzf", "none"])
+    ap.add_argument("--output_dir",    type=Path, required=True)
+    ap.add_argument("--train_frac",    type=float, default=0.8)
+    ap.add_argument("--val_frac",      type=float, default=0.1)
+    ap.add_argument("--seed",          type=int,   default=42)
+    ap.add_argument("--min_contig_len", type=int,  default=500)
+    ap.add_argument("--compression",   default="gzip", choices=["gzip", "lzf", "none"])
     args = ap.parse_args()
 
     if args.compression == "none":

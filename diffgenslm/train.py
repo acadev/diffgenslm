@@ -132,6 +132,8 @@ def build_model_config(cfg: dict) -> DiffGenomeConfig:
         dropout=m.get("dropout", 0.1),
         pad_token_id=m.get("pad_token_id", 0),
         mask_token_id=m.get("mask_token_id", 4),
+        max_rel_dist=m.get("max_rel_dist", 128),
+        same_strand_bias_init=m.get("same_strand_bias_init", 0.1),
     )
 
 
@@ -357,12 +359,14 @@ def train(args):
         pbar = tqdm(train_loader, total=max_train_steps,
                     desc=f"Epoch {epoch}/{epochs}", disable=not is_main)
 
-        for step, x0 in enumerate(pbar):
+        for step, batch in enumerate(pbar):
             if step >= max_train_steps:
                 break
 
-            x0 = x0.to(device, non_blocking=True)
-            batch_t0 = time.perf_counter()
+            x0, strand_ids = batch
+            x0         = x0.to(device, non_blocking=True)
+            strand_ids = strand_ids.to(device, non_blocking=True)
+            batch_t0   = time.perf_counter()
 
             # Forward diffusion: sample t, mask tokens
             xt, mask, t_sample = forward_process(x0, mask_token_id, pad_token_id)
@@ -372,7 +376,7 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=dtype, enabled=(is_cuda and (args.fp16 or args.bf16))):
-                logits = model(xt)
+                logits = model(xt, strand_ids=strand_ids)
                 loss   = diffusion_loss(logits, x0, mask, t_sample)
 
             scaler.scale(loss).backward()
@@ -431,14 +435,16 @@ def train(args):
             model.eval()
             vsum_loss = vsum_acc = vn = 0.0
             with torch.no_grad():
-                for vstep, x0 in enumerate(val_loader):
+                for vstep, batch in enumerate(val_loader):
                     if max_val_steps is not None and vstep >= max_val_steps:
                         break
-                    x0   = x0.to(device, non_blocking=True)
+                    x0, strand_ids = batch
+                    x0         = x0.to(device, non_blocking=True)
+                    strand_ids = strand_ids.to(device, non_blocking=True)
                     xt, mask, _ = forward_process(x0, mask_token_id, pad_token_id)
                     with torch.amp.autocast("cuda", dtype=dtype,
                                            enabled=(is_cuda and (args.fp16 or args.bf16))):
-                        logits = model(xt)
+                        logits = model(xt, strand_ids=strand_ids)
                         vl     = simple_loss(logits, x0, mask)
                     vsum_loss += vl.item()
                     vsum_acc  += _token_accuracy(logits, x0, mask)
