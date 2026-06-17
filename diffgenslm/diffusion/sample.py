@@ -80,6 +80,11 @@ def sample(
         # Forward pass
         logits = model(x)                                            # [B, L, V]
 
+        # A denoising model must never predict the absorbing state (mask) or
+        # padding as a clean token — zero out those logit entries.
+        logits[:, :, mask_token_id] = float("-inf")
+        logits[:, :, pad_token_id]  = float("-inf")
+
         # Sample or greedy-pick tokens at masked positions
         if temperature > 0:
             probs = _apply_temperature_and_top_p(logits, temperature, top_p)
@@ -110,9 +115,11 @@ def sample(
             x[b, top_idxs] = predicted[b, top_idxs]
             is_masked[b, top_idxs] = False
 
-    # Final pass: replace any remaining masks with model's best guess
+    # Final pass: replace any remaining masks — again excluding special tokens
     if is_masked.any():
         logits = model(x)
+        logits[:, :, mask_token_id] = float("-inf")
+        logits[:, :, pad_token_id]  = float("-inf")
         final_pred = logits.argmax(dim=-1)
         x[is_masked] = final_pred[is_masked]
 

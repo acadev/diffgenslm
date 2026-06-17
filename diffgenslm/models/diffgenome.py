@@ -90,7 +90,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * norm).type_as(x) * self.weight
+        return (x.float() * norm * self.weight).type_as(x)
 
 
 class SwiGLU(nn.Module):
@@ -232,10 +232,11 @@ class DiffGenomeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                # [B, L]
+        input_ids: torch.Tensor,                      # [B, L]
         padding_mask: Optional[torch.Tensor] = None,  # [B, L] bool True=real token
-    ) -> torch.Tensor:
-        """Returns logits [B, L, vocab_size]."""
+        return_hidden_states: bool = False,
+    ):
+        """Returns logits [B, L, V], or (logits, hidden) when return_hidden_states=True."""
         _, L = input_ids.shape
 
         if padding_mask is None:
@@ -250,7 +251,11 @@ class DiffGenomeModel(nn.Module):
             x = block(x, fc, fs, padding_mask)
 
         x = self.norm(x)
-        return self.lm_head(x)                 # [B, L, V]
+        logits = self.lm_head(x)              # [B, L, V]
+
+        if return_hidden_states:
+            return logits, x                  # (logits, last hidden state)
+        return logits
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
