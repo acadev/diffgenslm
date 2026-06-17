@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Data / checkpoints
+*.h5
+*.hdf5
+checkpoints/
+*.pt
+*.pth
+
+# Training artifacts
+wandb/
+runs/
+*.log
+
+# Tokenizer artifacts (trained, not source)
+*.model
+*.vocab
+
+# Environment
+.env
+*.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp

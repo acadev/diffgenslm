@@ -1,0 +1,25 @@
+# DiffGenSLM — Medium model config (~220M params)
+# Phase 2 scale-up: multi-node Polaris / Aurora
+
+model:
+  vocab_size: 12376        # 88 codon + 4096 functional + 8192 noncoding
+  hidden_size: 1024
+  num_layers: 16
+  num_heads: 16
+  num_kv_heads: 8          # GQA: 2 Q heads per KV head
+  ffn_intermediate_size: 2730   # SwiGLU: ≈ 8/3 * hidden
+  rope_theta: 10000.0
+  max_seq_len: 8192
+  dropout: 0.1
+  pad_token_id: 0
+  mask_token_id: 4
+
+training:
+  epochs: 30
+  seq_len: 8192
+  batch_size: 4            # per GPU; use gradient accumulation for larger effective batch
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  seed: 42

@@ -1,0 +1,26 @@
+# DiffGenSLM — Small model config (~28M params)
+# Phase 1 validation: single node, 4x A100 on Polaris
+
+model:
+  vocab_size: 8280         # 88 codon + 4096 functional BPE + 4096 noncoding BPE
+  hidden_size: 512
+  num_layers: 8
+  num_heads: 8
+  num_kv_heads: 4          # GQA: 2 Q heads per KV head
+  ffn_intermediate_size: 1366   # SwiGLU: ≈ 8/3 * hidden
+  rope_theta: 10000.0
+  max_seq_len: 4096
+  dropout: 0.1
+  pad_token_id: 0
+  mask_token_id: 4         # <mask> in composite vocab
+
+training:
+  epochs: 50
+  seq_len: 4096
+  batch_size: 8            # per GPU; effective = 8 * 4 GPUs = 32
+  lr: 3.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  seed: 42
+  val_check_interval: 1    # validate every N epochs
