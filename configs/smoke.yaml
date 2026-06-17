@@ -22,7 +22,8 @@ training:
   lr: 3.0e-4
   weight_decay: 0.01
   epochs: 30
-  max_steps_per_epoch: 500   # cap for quick smoke run (~8 min/epoch on MPS)
+  max_steps_per_epoch: 500   # cap for quick smoke run (~1 min/epoch on MPS)
+  max_val_steps: 100         # cap validation too
   num_workers: 0             # 0 for Mac MPS compatibility
   seed: 42
   grad_clip: 1.0

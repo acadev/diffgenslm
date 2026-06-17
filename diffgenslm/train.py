@@ -426,11 +426,14 @@ def train(args):
 
         # ── Validation ────────────────────────────────────────────────────
         val_loss = val_acc = None
+        max_val_steps = training_cfg.get("max_val_steps", None)
         if val_loader is not None:
             model.eval()
             vsum_loss = vsum_acc = vn = 0.0
             with torch.no_grad():
-                for x0 in val_loader:
+                for vstep, x0 in enumerate(val_loader):
+                    if max_val_steps is not None and vstep >= max_val_steps:
+                        break
                     x0   = x0.to(device, non_blocking=True)
                     xt, mask, _ = forward_process(x0, mask_token_id, pad_token_id)
                     with torch.amp.autocast("cuda", dtype=dtype,
