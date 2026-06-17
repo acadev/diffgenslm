@@ -94,8 +94,13 @@ def setup_distributed(backend: str = "nccl"):
         torch.cuda.set_device(device)
         return rank, ws, device
 
-    # Single GPU / CPU fallback
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Single GPU / MPS / CPU fallback
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     return 0, 1, device
 
 
@@ -223,6 +228,8 @@ def train(args):
     training_cfg = cfg.get("training", {})
     model_cfg    = build_model_config(cfg)
 
+    is_cuda = device.type == "cuda"
+
     # ── Model ─────────────────────────────────────────────────────────────
     model = DiffGenomeModel(model_cfg).to(device)
 
@@ -246,11 +253,13 @@ def train(args):
 
     train_loader = build_dataloader(
         args.hdf5_dir, "train", seq_len, batch_size,
+        pad_token_id=model_cfg.pad_token_id,
         rank=rank, world_size=world_size, num_workers=num_workers,
         seed=training_cfg.get("seed", 42),
     )
     val_loader = build_dataloader(
         args.hdf5_dir, "val", seq_len, batch_size,
+        pad_token_id=model_cfg.pad_token_id,
         rank=rank, world_size=world_size, num_workers=num_workers,
         shuffle=False, seed=training_cfg.get("seed", 42) + 1,
     ) if _has_val_split(args.hdf5_dir) else None
@@ -263,6 +272,11 @@ def train(args):
     else:
         max_train_steps = len(train_loader)
 
+    # Optional per-epoch step cap (useful for smoke tests on large datasets)
+    _epoch_step_cap = training_cfg.get("max_steps_per_epoch", None)
+    if _epoch_step_cap is not None:
+        max_train_steps = min(max_train_steps, int(_epoch_step_cap))
+
     if is_main:
         print(f"[DATA] train batches/rank={len(train_loader)} (sync={max_train_steps})"
               + (f"  val={len(val_loader)}" if val_loader else "  val=none"))
@@ -274,7 +288,7 @@ def train(args):
 
     epochs    = training_cfg.get("epochs", 20)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs * max_train_steps, eta_min=lr / 10)
-    scaler    = torch.amp.GradScaler("cuda", enabled=(args.fp16 and not args.bf16))
+    scaler    = torch.amp.GradScaler("cuda", enabled=(args.fp16 and not args.bf16 and is_cuda))
 
     # ── Checkpoint & resume ───────────────────────────────────────────────
     save_dir = Path(args.save_dir)
@@ -357,7 +371,7 @@ def train(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", dtype=dtype, enabled=(args.fp16 or args.bf16)):
+            with torch.amp.autocast("cuda", dtype=dtype, enabled=(is_cuda and (args.fp16 or args.bf16))):
                 logits = model(xt)
                 loss   = diffusion_loss(logits, x0, mask, t_sample)
 
@@ -420,7 +434,7 @@ def train(args):
                     x0   = x0.to(device, non_blocking=True)
                     xt, mask, _ = forward_process(x0, mask_token_id, pad_token_id)
                     with torch.amp.autocast("cuda", dtype=dtype,
-                                           enabled=(args.fp16 or args.bf16)):
+                                           enabled=(is_cuda and (args.fp16 or args.bf16))):
                         logits = model(xt)
                         vl     = simple_loss(logits, x0, mask)
                     vsum_loss += vl.item()

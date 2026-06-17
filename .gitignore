@@ -24,6 +24,9 @@ runs/
 *.model
 *.vocab
 
+# Local data / genome files (large, not tracked)
+/data/
+
 # Environment
 .env
 *.env

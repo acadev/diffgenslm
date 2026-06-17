@@ -158,7 +158,7 @@ def build_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         persistent_workers=(num_workers > 0),
         prefetch_factor=4 if num_workers > 0 else None,
         drop_last=True,

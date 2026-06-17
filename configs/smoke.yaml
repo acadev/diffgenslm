@@ -1,0 +1,28 @@
+# Smoke-test config — small model, quick to train on a single GPU/MPS.
+# Tokenizer: CompositeGenomeTokenizerV2 with hf-codon-tokenizer-special +
+#            bpe-spm-functional-4096-special + bpe-spm-noncoding-4096-special
+# vocab_size=8281, pad_token_id=6, mask_token_id=3
+
+model:
+  vocab_size: 8281
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+  num_kv_heads: 2
+  ffn_intermediate_size: 688   # ~8/3 * 256 rounded
+  rope_theta: 10000.0
+  max_seq_len: 1024
+  dropout: 0.1
+  pad_token_id: 6
+  mask_token_id: 3
+
+training:
+  seq_len: 512
+  batch_size: 8
+  lr: 3.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  max_steps_per_epoch: 500   # cap for quick smoke run (~8 min/epoch on MPS)
+  num_workers: 0             # 0 for Mac MPS compatibility
+  seed: 42
+  grad_clip: 1.0

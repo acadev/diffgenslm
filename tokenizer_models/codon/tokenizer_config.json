@@ -1,0 +1,9 @@
+{
+  "model_type": "dna",
+  "do_lower_case": false,
+  "mask_token": "<mask>",
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "pad_token": "<pad>",
+  "unk_token": "<unk>"
+}
