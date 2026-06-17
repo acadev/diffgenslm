@@ -48,7 +48,16 @@ diffgenslm/
 │   └── sample.py           # Iterative confidence-ranked unmasking sampler
 ├── data/
 │   └── genome_dataset.py   # GenomeDiffusionDataset + build_dataloader()
+├── eval/
+│   └── biolab_model.py     # biolab LM adapter (NuclCharTokenizer + DiffGenSLM)
 └── train.py                # DDP training loop (Polaris + Aurora)
+
+tests/
+├── conftest.py             # Shared fixtures (tiny model, checkpoint, tokenizer dir)
+├── test_model.py           # Architecture tests (RMSNorm, RoPE, GQA, forward shapes)
+├── test_diffusion.py       # Diffusion pipeline tests (process, loss, sampler)
+├── test_biolab_adapter.py  # biolab LM protocol tests (tokeniser, embeddings, generation)
+└── test_preprocessing.py  # Parser + BPE extraction tests (GTO, GFF3, rev-comp)
 
 scripts/
 ├── polaris_preprocess.sh   # PBS job: Phase 0 data pipeline on Polaris
@@ -75,6 +84,12 @@ pip install mpi4py
 ```
 
 **Python 3.9+ and PyTorch ≥ 2.1** are required. On Aurora, use the Intel oneAPI frameworks module rather than a pip-installed torch.
+
+For the biolab evaluation harness:
+
+```bash
+pip install git+https://github.com/ramanathanlab/biolab.git
+```
 
 ---
 
@@ -298,6 +313,104 @@ generated = sample(
 context[0, :50] = known_prefix_tokens
 filled = infill(model, context, cfg.mask_token_id, num_steps=64)
 ```
+
+---
+
+## biolab evaluation
+
+DiffGenSLM integrates with the [biolab](https://github.com/ramanathanlab/biolab) benchmark suite via the adapter in `diffgenslm/eval/biolab_model.py`.
+
+### How it works
+
+biolab tasks supply raw DNA strings without GFF annotation. The adapter uses a character-level tokeniser (`NuclCharTokenizer`) that maps each nucleotide A/T/C/G to its single-base token ID in `codon/vocab.json`. This gives `model_encoding='char'`, which biolab routes to:
+- sequence-level tasks → `average_pool` transform (mean over token embeddings)
+- nucleotide-level tasks → `full_sequence` transform (per-nucleotide embeddings)
+
+`generate_embeddings` extracts the final transformer hidden state (before the LM head); `generate_sequences` runs the iterative confidence-ranked unmasking sampler and decodes token IDs back to a DNA string.
+
+### Running an evaluation
+
+Create a YAML config and run biolab's evaluate entrypoint:
+
+```yaml
+# eval_config.yaml
+lm_config:
+  name: DiffGenSLM
+  checkpoint_path: /path/to/checkpoints/best.pt
+  tokenizer_dir:   /path/to/tokenizer
+  max_length:      2048
+  num_sample_steps: 64
+  sample_schedule: cosine
+
+task_configs:
+  - name: GCContent
+    dataset_name_or_path: /path/to/gc_content_dataset
+    metrics: [mse, r2]
+    task_type: regression
+
+output_dir: results/diffgenslm_gcontent
+```
+
+```bash
+python -m biolab.evaluate --config eval_config.yaml
+```
+
+Results (metrics + model outputs) are written to `output_dir`.
+
+### Registering DiffGenSLM in biolab
+
+To make DiffGenSLM discoverable by `biolab.modeling.get_model`, add two lines to `biolab/modeling/models/__init__.py`:
+
+```python
+from diffgenslm.eval.biolab_model import diffgenslm_models   # add this
+model_registry = {
+    ...
+    **diffgenslm_models,     # add this
+}
+```
+
+Alternatively, use the adapter directly without modifying biolab:
+
+```python
+from diffgenslm.eval.biolab_model import DiffGenSLM, DiffGenSLMConfig
+from biolab.tasks import get_task
+from biolab.tasks.gc_content import GCContentConfig
+
+model = DiffGenSLM(DiffGenSLMConfig(
+    checkpoint_path="checkpoints/best.pt",
+    tokenizer_dir="tokenizer/",
+))
+task = get_task(GCContentConfig(dataset_name_or_path="data/gc_content",
+                                output_dir="results/", metrics=["mse", "r2"],
+                                task_type="regression"))
+metrics = task.evaluate(model)
+for m in metrics:
+    print(m.report())
+```
+
+---
+
+## Testing
+
+```bash
+# Run the full suite (116 tests, ~2 seconds on CPU)
+pytest tests/ -q
+
+# Run a specific module
+pytest tests/test_model.py -v
+pytest tests/test_diffusion.py -v
+pytest tests/test_biolab_adapter.py -v
+pytest tests/test_preprocessing.py -v
+```
+
+| File | Tests | What's covered |
+|---|---|---|
+| `test_model.py` | 14 | RMSNorm dtype, RoPE isometry, bidirectionality, weight tying, gradient flow, `return_hidden_states` |
+| `test_diffusion.py` | 29 | Forward process masking statistics, ELBO vs. unweighted loss, unmasking schedules, sampler invariants (no residual masks, fixed positions preserved, seed reproducibility) |
+| `test_biolab_adapter.py` | 38 | `NuclCharTokenizer` encode/decode/tokenize, config JSON+YAML roundtrip, embedding shapes and dtypes, generated sequences contain no mask tokens, fixed context preserved |
+| `test_preprocessing.py` | 35 | GTO coordinate conversion (1-based→0-based, fwd/rev strand), feature type filtering, GFF3 parsing, `build_id_mapping_from_gtos`, reverse-complement extraction |
+
+Fixtures live in `tests/conftest.py`: a session-scoped tiny model (`vocab=64`, `hidden=32`, `layers=2`) and matching checkpoint/tokenizer-dir pair let all tests run without disk I/O beyond a temporary directory.
 
 ---
 
